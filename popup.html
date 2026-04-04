@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="header">
+    <div class="title">
+      <span class="logo">⚡</span>
+      Speed Booster for ChatGPT
+      <span class="badge">FREE</span>
+    </div>
+    <div class="subtitle">Fix lag & freezing in long chats</div>
+  </div>
+
+  <div class="stats-row">
+    <div class="stat">
+      <span class="stat-icon">⚡</span>
+      <div>
+        <span class="stat-value" id="memorySaved">0%</span>
+        <span class="stat-label">Memory Saved</span>
+      </div>
+    </div>
+    <div class="stat">
+      <div>
+        <span class="stat-value" id="renderedCount">0 / 0</span>
+        <span class="stat-label">Rendered</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="setting-row">
+    <span class="setting-label">Enable Speed Booster</span>
+    <label class="toggle">
+      <input type="checkbox" id="enableToggle" checked>
+      <span class="slider"></span>
+    </label>
+  </div>
+
+  <div class="setting-row">
+    <div>
+      <span class="setting-label">Messages Buffer</span>
+      <div class="setting-hint">Messages to keep above/below viewport.<br>Lower = faster, higher = smoother scroll.</div>
+    </div>
+    <input type="number" id="bufferSize" min="3" max="50" value="15" class="number-input">
+  </div>
+
+  <div class="footer" id="statusBar">
+    Waiting for ChatGPT...
+  </div>
+
+  <div class="debug-section">
+    <button id="diagnoseBtn" class="debug-btn">🔍 Diagnose DOM</button>
+    <pre id="debugOutput" class="debug-output"></pre>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
