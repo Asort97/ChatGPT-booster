@@ -7,30 +7,25 @@
 <body>
   <div class="header">
     <div class="title">
-      <span class="logo">⚡</span>
-      Speed Booster for ChatGPT
-      <span class="badge">FREE</span>
+      <span class="logo">SB</span>
+      ChatGPT Speed Booster
+      <span class="badge">v6</span>
     </div>
-    <div class="subtitle">Fix lag & freezing in long chats</div>
+    <div class="subtitle">Show only the latest messages</div>
   </div>
 
   <div class="stats-row">
     <div class="stat">
-      <span class="stat-icon">⚡</span>
-      <div>
-        <span class="stat-value" id="memorySaved">0%</span>
-        <span class="stat-label">Memory Saved</span>
-      </div>
+      <span class="stat-value" id="visibleCount">0 / 0</span>
+      <span class="stat-label">Visible</span>
     </div>
     <div class="stat">
-      <div>
-        <span class="stat-value" id="renderedCount">0 / 0</span>
-        <span class="stat-label">Rendered</span>
-      </div>
+      <span class="stat-value" id="hiddenCount">0</span>
+      <span class="stat-label">Hidden</span>
     </div>
   </div>
 
-  <div class="setting-row">
+  <div class="setting-row compact">
     <span class="setting-label">Enable Speed Booster</span>
     <label class="toggle">
       <input type="checkbox" id="enableToggle" checked>
@@ -40,19 +35,14 @@
 
   <div class="setting-row">
     <div>
-      <span class="setting-label">Messages Buffer</span>
-      <div class="setting-hint">Messages to keep above/below viewport.<br>Lower = faster, higher = smoother scroll.</div>
+      <span class="setting-label">Messages shown</span>
+      <div class="setting-hint">Older messages are removed from live DOM and can be loaded above the chat.</div>
     </div>
-    <input type="number" id="bufferSize" min="3" max="50" value="15" class="number-input">
+    <input type="number" id="visibleMessages" min="2" max="200" value="15" class="number-input">
   </div>
 
   <div class="footer" id="statusBar">
     Waiting for ChatGPT...
-  </div>
-
-  <div class="debug-section">
-    <button id="diagnoseBtn" class="debug-btn">🔍 Diagnose DOM</button>
-    <pre id="debugOutput" class="debug-output"></pre>
   </div>
 
   <script src="popup.js"></script>

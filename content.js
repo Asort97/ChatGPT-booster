@@ -1,323 +1,383 @@
 /**
- * ChatGPT Speed Booster — Content Script v2
- * 
- * Simple approach: just toggle display:none on off-screen conversation turns.
- * No innerHTML copying, no heavy processing. Pure CSS visibility toggling.
+ * ChatGPT Speed Booster - ISOLATED-world content script.
+ *
+ * Two responsibilities:
+ *   1. Keep the page-script's localStorage-backed settings in sync with the
+ *      extension's chrome.storage. The page-script (MAIN world) reads these
+ *      to decide whether/how to trim API responses before React sees them.
+ *   2. Provide a DOM-level fallback "keep-last-N" trim, in case ChatGPT ever
+ *      loads messages bypassing the intercepted /backend-api/conversation/
+ *      endpoint (paginated history, hot-reload SPA navigation, etc).
+ *   3. Answer the popup's getStats / updateConfig messages.
  */
 
 (function () {
   "use strict";
 
-  const LOG = (...args) => console.log("[SpeedBooster]", ...args);
+  const TURN_SELECTOR_STRATEGIES = [
+    '[data-testid^="conversation-turn-"]',
+    'article[data-message-id]',
+    'main article',
+    'div[data-message-author-role]',
+  ];
+  const VID_ATTR = "data-sb-vid";
+  const LOAD_BTN_ID = "speed-booster-load-older";
+  const STYLE_ID = "speed-booster-style";
+  const STOP_BUTTON_SELECTOR = '[data-testid="stop-button"]';
+  const SETTINGS_KEY = "sb_fetch_settings";
+  const TRIMMED_ATTR = "data-sb-trimmed";
+  const BYPASS_KEY = "sb_skip_trim_once";
 
-  const DEFAULTS = { enabled: true, bufferSize: 10 };
-  let config = { ...DEFAULTS };
-  let isActive = false;
-  let tickInterval = null;
-  let lastAnchor = -1; // last known viewport anchor index
+  const DEFAULTS = { enabled: true, visibleMessages: 15 };
 
-  // --- CSS injection: fastest way to bulk-hide ---
-  const style = document.createElement("style");
-  style.id = "speed-booster-style";
-  document.head.appendChild(style);
+  const LOAD_BATCH_SIZE = 10;
+  const MUTATION_DEBOUNCE_MS = 150;
+  const URL_CHECK_INTERVAL = 1000;
+  const BOOT_DELAY_MS = 800;
 
-  function hideByCSS(selector, hideIndices) {
-    // Build CSS rules to hide specific conversation turns by nth-child
-    // This is the fastest method — browser handles it natively
-    if (hideIndices.length === 0) {
-      style.textContent = "";
+  // Detached turns in oldest -> newest order.
+  const detached = [];
+
+  const state = {
+    enabled: true,
+    visibleMessages: DEFAULTS.visibleMessages,
+    nextVid: 1,
+    observer: null,
+    lastUrl: location.href,
+    mutationTimer: null,
+    booted: false,
+    suppressMutations: false,
+    stats: { total: 0, rendered: 0 },
+  };
+
+  function clamp(value, min, max) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return min;
+    return Math.min(max, Math.max(min, Math.round(n)));
+  }
+
+  function normalizeConfig(raw) {
+    return {
+      enabled: raw && raw.enabled !== false,
+      visibleMessages: clamp((raw && raw.visibleMessages) || DEFAULTS.visibleMessages, 1, 200),
+    };
+  }
+
+  function syncToPageScript(cfg) {
+    try {
+      localStorage.setItem(
+        SETTINGS_KEY,
+        JSON.stringify({
+          enabled: cfg.enabled,
+          visibleMessages: cfg.visibleMessages,
+        }),
+      );
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
+  function injectStyle() {
+    if (document.getElementById(STYLE_ID)) return;
+    const style = document.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent =
+      "#" + LOAD_BTN_ID + "{display:block;margin:16px auto;padding:8px 16px;" +
+      "background:rgba(255,255,255,0.08);color:inherit;" +
+      "border:1px solid rgba(255,255,255,0.15);border-radius:8px;" +
+      "font:inherit;font-size:13px;cursor:pointer;}" +
+      "#" + LOAD_BTN_ID + ":hover{background:rgba(255,255,255,0.14);}";
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function isStreaming() {
+    return !!document.querySelector(STOP_BUTTON_SELECTOR);
+  }
+
+  function findTurns() {
+    for (const sel of TURN_SELECTOR_STRATEGIES) {
+      const list = document.querySelectorAll(sel);
+      if (list.length) return Array.from(list).filter((n) => n instanceof HTMLElement);
+    }
+    return [];
+  }
+
+  function ensureVid(node) {
+    let vid = node.getAttribute(VID_ATTR);
+    if (!vid) {
+      vid = String(state.nextVid++);
+      node.setAttribute(VID_ATTR, vid);
+    }
+    return vid;
+  }
+
+  function getTurnContainer() {
+    const turns = findTurns();
+    if (!turns.length) return null;
+    return turns[0].parentElement;
+  }
+
+  function ensureLoadButton(parent, count) {
+    let btn = document.getElementById(LOAD_BTN_ID);
+    if (!count) {
+      if (btn) btn.remove();
+      return;
+    }
+    const showing = Math.min(LOAD_BATCH_SIZE, count);
+    const label = "Load " + showing + " older messages (" + count + " hidden)";
+    if (!btn) {
+      btn = document.createElement("button");
+      btn.id = LOAD_BTN_ID;
+      btn.type = "button";
+      btn.addEventListener("click", onLoadOlderClick);
+    }
+    btn.textContent = label;
+    if (!parent) return;
+    if (btn.parentElement !== parent || parent.firstChild !== btn) {
+      parent.insertBefore(btn, parent.firstChild);
+    }
+  }
+
+  function onLoadOlderClick() {
+    if (!detached.length) return;
+    const parent = getTurnContainer();
+    if (!parent) return;
+    const batch = Math.min(LOAD_BATCH_SIZE, detached.length);
+    const slice = detached.splice(detached.length - batch, batch);
+    state.suppressMutations = true;
+    try {
+      const btn = document.getElementById(LOAD_BTN_ID);
+      const anchor = btn ? btn.nextSibling : parent.firstChild;
+      slice.forEach((entry) => parent.insertBefore(entry.node, anchor));
+    } finally {
+      state.suppressMutations = false;
+    }
+    applyTrim();
+  }
+
+  function applyTrim() {
+    if (!state.enabled) return;
+
+    if (isStreaming()) {
+      const turns = findTurns();
+      state.stats.total = turns.length + detached.length;
+      state.stats.rendered = turns.length;
       return;
     }
 
-    const rules = hideIndices
-      .map(i => `${selector}:nth-child(${i + 1})`)
-      .join(",\n");
-
-    style.textContent = `${rules} { display: none !important; }`;
-  }
-
-  function clearCSS() {
-    style.textContent = "";
-  }
-
-  // --- Find conversation turns ---
-
-  const SELECTOR = '[data-testid^="conversation-turn-"]';
-
-  function getTurns() {
-    return document.querySelectorAll(SELECTOR);
-  }
-
-  // --- Find scroll container ---
-
-  function getScrollContainer() {
-    // ChatGPT's scroll container: walk up from first turn
-    const turn = document.querySelector(SELECTOR);
-    if (!turn) return null;
-
-    let el = turn.parentElement;
-    while (el && el !== document.body) {
-      const style = getComputedStyle(el);
-      if ((style.overflowY === "auto" || style.overflowY === "scroll") &&
-          el.scrollHeight > el.clientHeight + 100) {
-        return el;
-      }
-      el = el.parentElement;
+    const turns = findTurns();
+    const parent = turns.length ? turns[0].parentElement : null;
+    if (!parent) {
+      state.stats.total = detached.length;
+      state.stats.rendered = 0;
+      return;
     }
 
-    // Fallback: walk up from main
-    const main = document.querySelector("main");
-    if (main) {
-      const all = main.querySelectorAll("*");
-      for (const candidate of all) {
-        const s = getComputedStyle(candidate);
-        if ((s.overflowY === "auto" || s.overflowY === "scroll") &&
-            candidate.scrollHeight > candidate.clientHeight + 100) {
-          return candidate;
-        }
-      }
-    }
+    const limit = state.visibleMessages;
+    const excess = turns.length - limit;
 
-    return null;
-  }
-
-  // --- Core logic: figure out which turns to show/hide ---
-
-  function updateDirect() {
-    if (!config.enabled) return;
-
-    const turns = getTurns();
-    const count = turns.length;
-    if (count === 0) return;
-
-    const buf = config.bufferSize;
-    const vh = window.innerHeight;
-
-    // Find anchor: a visible turn near viewport
-    // Start search near last known anchor for speed (O(buf) instead of O(n))
-    let anchorIdx = -1;
-    const searchStart = (lastAnchor >= 0 && lastAnchor < count) ? Math.max(0, lastAnchor - buf) : 0;
-    const searchEnd = Math.min(count, searchStart + buf * 4);
-
-    for (let i = searchStart; i < searchEnd; i++) {
-      const turn = turns[i];
-      if (turn.dataset.sbHidden) continue;
-      const rect = turn.getBoundingClientRect();
-      if (rect.bottom > -300 && rect.top < vh + 300) {
-        anchorIdx = i;
-      }
-      // Once we've gone past the viewport, stop
-      if (rect.top > vh + 500) break;
-    }
-
-    // Fallback: full scan if focused search failed
-    if (anchorIdx === -1) {
-      for (let i = 0; i < count; i++) {
-        if (turns[i].dataset.sbHidden) continue;
-        const rect = turns[i].getBoundingClientRect();
-        if (rect.bottom > -300 && rect.top < vh + 300) {
-          anchorIdx = i;
-        }
-        if (rect.top > vh + 500) break;
-      }
-    }
-
-    if (anchorIdx === -1) anchorIdx = count - 1;
-    lastAnchor = anchorIdx;
-
-    const keepStart = Math.max(0, anchorIdx - buf);
-    const keepEnd = Math.min(count - 1, anchorIdx + buf);
-
-    let hiddenCount = 0;
-
-    for (let i = 0; i < count; i++) {
-      const turn = turns[i];
-      const shouldHide = (i < keepStart || i > keepEnd) && i !== count - 1;
-
-      if (shouldHide) {
-        if (!turn.dataset.sbHidden) {
-          turn.dataset.sbHidden = "1";
-          turn.style.setProperty("display", "none", "important");
-        }
-        hiddenCount++;
-      } else {
-        if (turn.dataset.sbHidden) {
-          turn.removeAttribute("style");
-          delete turn.dataset.sbHidden;
-        }
-      }
-    }
-
-    LOG("Updated: anchor=", anchorIdx, "keep=", keepStart, "-", keepEnd, "hidden=", hiddenCount, "/", count);
-    sendStats(count, hiddenCount);
-  }
-
-  // --- Scroll handling ---
-
-  let scrollContainer = null;
-  let scrollTimer = null;
-
-  function onScroll() {
-    if (scrollTimer) return; // throttle
-    scrollTimer = setTimeout(() => {
-      scrollTimer = null;
-      updateDirect();
-    }, 100);
-  }
-
-  function attachScroll() {
-    scrollContainer = getScrollContainer();
-    if (scrollContainer) {
-      scrollContainer.addEventListener("scroll", onScroll, { passive: true });
-      LOG("Attached scroll listener to:", scrollContainer.className.slice(0, 50));
-    } else {
-      window.addEventListener("scroll", onScroll, { passive: true });
-      LOG("Attached scroll listener to window");
-    }
-  }
-
-  function detachScroll() {
-    if (scrollContainer) {
-      scrollContainer.removeEventListener("scroll", onScroll);
-    }
-    window.removeEventListener("scroll", onScroll);
-    scrollContainer = null;
-  }
-
-  // --- Stats ---
-
-  function sendStats(total, hidden) {
+    state.suppressMutations = true;
     try {
-      chrome.runtime.sendMessage({
-        type: "stats",
+      if (excess > 0) {
+        for (let i = 0; i < excess; i++) {
+          const node = turns[i];
+          ensureVid(node);
+          if (node.isConnected) node.parentElement.removeChild(node);
+          detached.push({ node });
+        }
+      }
+      ensureLoadButton(parent, detached.length);
+    } finally {
+      state.suppressMutations = false;
+    }
+
+    const visibleAfter = Math.min(turns.length, limit);
+    state.stats.total = visibleAfter + detached.length;
+    state.stats.rendered = visibleAfter;
+  }
+
+  function scheduleApply() {
+    if (state.mutationTimer) return;
+    state.mutationTimer = setTimeout(() => {
+      state.mutationTimer = null;
+      applyTrim();
+    }, MUTATION_DEBOUNCE_MS);
+  }
+
+  function attachObserver() {
+    if (state.observer) state.observer.disconnect();
+    const root = document.querySelector("main") || document.body;
+    if (!root) return;
+    state.observer = new MutationObserver(() => {
+      if (state.suppressMutations) return;
+      scheduleApply();
+    });
+    state.observer.observe(root, { childList: true, subtree: true });
+  }
+
+  function restoreAll() {
+    if (!detached.length) {
+      const btn = document.getElementById(LOAD_BTN_ID);
+      if (btn) btn.remove();
+      return;
+    }
+    const parent = getTurnContainer() || document.querySelector("main") || document.body;
+    state.suppressMutations = true;
+    try {
+      const btn = document.getElementById(LOAD_BTN_ID);
+      const anchor = btn ? btn.nextSibling : parent.firstChild;
+      detached.forEach((entry) => parent.insertBefore(entry.node, anchor));
+      detached.length = 0;
+      if (btn) btn.remove();
+    } finally {
+      state.suppressMutations = false;
+    }
+  }
+
+  function boot() {
+    if (state.booted) return;
+    state.booted = true;
+    injectStyle();
+    attachObserver();
+    applyTrim();
+  }
+
+  function teardown() {
+    if (state.observer) state.observer.disconnect();
+    if (state.mutationTimer) clearTimeout(state.mutationTimer);
+    state.observer = null;
+    state.mutationTimer = null;
+    state.booted = false;
+    restoreAll();
+  }
+
+  function resetForUrl() {
+    if (state.observer) state.observer.disconnect();
+    if (state.mutationTimer) clearTimeout(state.mutationTimer);
+    state.observer = null;
+    state.mutationTimer = null;
+    state.booted = false;
+    detached.length = 0;
+    state.nextVid = 1;
+    if (state.enabled) setTimeout(boot, BOOT_DELAY_MS);
+  }
+
+  function startUrlWatcher() {
+    setInterval(() => {
+      if (location.href === state.lastUrl) return;
+      state.lastUrl = location.href;
+      resetForUrl();
+    }, URL_CHECK_INTERVAL);
+  }
+
+  function fetchTrimmed() {
+    try {
+      return document.documentElement.getAttribute(TRIMMED_ATTR) === "1";
+    } catch (_) {
+      return false;
+    }
+  }
+
+  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (!message) return false;
+
+    if (message.type === "getStats") {
+      if (state.enabled) applyTrim();
+      sendResponse({
+        ok: true,
         data: {
-          total,
-          rendered: total - hidden,
-          hidden,
-          memorySaved: total > 0 ? Math.round((hidden / total) * 100) : 0,
-          enabled: config.enabled,
+          enabled: state.enabled,
+          total: state.stats.total,
+          hidden: Math.max(0, state.stats.total - state.stats.rendered),
+          rendered: state.stats.rendered,
+          visibleMessages: state.visibleMessages,
+          mode: state.enabled ? (fetchTrimmed() ? "Active (fast)" : "Active") : "Disabled",
+          selectorStrategy: "fetch-intercept+keep-last-n",
         },
       });
-    } catch (e) { /* popup closed */ }
-  }
-
-  // --- Periodic tick: handles new messages, DOM changes ---
-
-  function startTick() {
-    if (tickInterval) clearInterval(tickInterval);
-    tickInterval = setInterval(() => {
-      if (!config.enabled) return;
-      const turns = getTurns();
-      if (turns.length > 0 && !isActive) {
-        LOG("Found", turns.length, "turns, activating");
-        isActive = true;
-        attachScroll();
-        updateDirect();
-      } else if (isActive) {
-        // Just update to catch new messages
-        updateDirect();
-      }
-    }, 3000);
-  }
-
-  // --- Init / Reset ---
-
-  function reset() {
-    // Unhide everything
-    const turns = getTurns();
-    for (const turn of turns) {
-      if (turn.dataset.sbHidden) {
-        turn.removeAttribute("style");
-        delete turn.dataset.sbHidden;
-      }
-    }
-    clearCSS();
-    detachScroll();
-    if (tickInterval) { clearInterval(tickInterval); tickInterval = null; }
-    if (scrollTimer) { clearTimeout(scrollTimer); scrollTimer = null; }
-    isActive = false;
-  }
-
-  function init() {
-    LOG("Init, URL:", location.href);
-
-    const turns = getTurns();
-    if (turns.length > 0) {
-      LOG("Found", turns.length, "conversation turns");
-      isActive = true;
-      attachScroll();
-      updateDirect();
-    } else {
-      LOG("No turns yet, waiting...");
+      return true;
     }
 
-    startTick();
-  }
+    if (message.type === "updateConfig") {
+      const merged = normalizeConfig({
+        enabled: state.enabled,
+        visibleMessages: state.visibleMessages,
+        ...message.data,
+      });
+      const wasEnabled = state.enabled;
+      const oldVisible = state.visibleMessages;
+      state.enabled = merged.enabled;
+      state.visibleMessages = merged.visibleMessages;
 
-  // --- URL watcher (SPA navigation) ---
+      chrome.storage.local.set({
+        config: { enabled: merged.enabled, visibleMessages: merged.visibleMessages },
+      });
+      syncToPageScript(merged);
 
-  function watchURL() {
-    let lastURL = location.href;
-    const check = () => {
-      if (location.href !== lastURL) {
-        lastURL = location.href;
-        LOG("URL changed");
-        reset();
-        setTimeout(init, 1500);
+      if (!state.enabled && wasEnabled) {
+        teardown();
+      } else if (state.enabled && !wasEnabled) {
+        boot();
+      } else if (state.enabled) {
+        applyTrim();
       }
-    };
-    const origPush = history.pushState;
-    const origReplace = history.replaceState;
-    history.pushState = function () { origPush.apply(this, arguments); check(); };
-    history.replaceState = function () { origReplace.apply(this, arguments); check(); };
-    window.addEventListener("popstate", check);
-  }
 
-  // --- Diagnosis ---
+      // If toggled or visible-count changed, reload so the fetch interceptor
+      // re-fetches the conversation with the new limit. Otherwise the page
+      // still shows whatever it loaded with the previous settings.
+      const toggled = wasEnabled !== merged.enabled;
+      const limitChanged = oldVisible !== merged.visibleMessages;
+      if (message.data && message.data.reload === false) {
+        sendResponse({ ok: true });
+        return true;
+      }
+      if (toggled || limitChanged) {
+        try {
+          localStorage.setItem(BYPASS_KEY, "0");
+        } catch (_) {
+          /* ignore */
+        }
+        sendResponse({ ok: true, reloading: true });
+        setTimeout(() => location.reload(), 80);
+        return true;
+      }
 
-  function diagnoseDOM() {
-    const main = document.querySelector("main");
-    const turns = getTurns();
-    const sc = getScrollContainer();
-    return {
-      url: location.href,
-      hasMain: !!main,
-      totalDOM: document.querySelectorAll("*").length,
-      turns: turns.length,
-      hiddenTurns: Array.from(turns).filter(t => t.dataset.sbHidden).length,
-      scrollContainer: sc ? { tag: sc.tagName, class: sc.className.slice(0, 80), scrollH: sc.scrollHeight } : null,
-      isActive,
-    };
-  }
-
-  // --- Message handler ---
-
-  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-    if (msg.type === "getStats") {
-      const turns = getTurns();
-      const hidden = Array.from(turns).filter(t => t.dataset.sbHidden).length;
-      sendStats(turns.length, hidden);
       sendResponse({ ok: true });
-    } else if (msg.type === "updateConfig") {
-      const wasEnabled = config.enabled;
-      config = { ...config, ...msg.data };
-      if (config.enabled && !wasEnabled) init();
-      else if (!config.enabled && wasEnabled) { reset(); sendStats(0, 0); }
-      else if (config.enabled) updateDirect();
-      chrome.storage.local.set({ config });
-      sendResponse({ ok: true });
-    } else if (msg.type === "diagnose") {
-      sendResponse({ ok: true, data: diagnoseDOM() });
+      return true;
     }
-    return true;
+
+    if (message.type === "loadFullConversation") {
+      try {
+        localStorage.setItem(BYPASS_KEY, "1");
+      } catch (_) {
+        /* ignore */
+      }
+      sendResponse({ ok: true });
+      setTimeout(() => location.reload(), 50);
+      return true;
+    }
+
+    return false;
   });
 
-  // --- Start ---
+  // Initial sync: write defaults to localStorage as soon as possible (before
+  // page-script runs the first fetch). Then refine when chrome.storage answers.
+  syncToPageScript(DEFAULTS);
 
   chrome.storage.local.get(["config"], (result) => {
-    if (result.config) config = { ...DEFAULTS, ...result.config };
-    LOG("Config:", JSON.stringify(config));
-    if (config.enabled) setTimeout(init, 1000);
-    watchURL();
+    const cfg = normalizeConfig(result.config || DEFAULTS);
+    state.enabled = cfg.enabled;
+    state.visibleMessages = cfg.visibleMessages;
+    syncToPageScript(cfg);
+    startUrlWatcher();
+
+    function start() {
+      if (state.enabled) setTimeout(boot, BOOT_DELAY_MS);
+    }
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", start);
+    } else {
+      start();
+    }
   });
 })();

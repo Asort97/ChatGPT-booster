@@ -1,0 +1,24 @@
+{
+  "name": "chatgpt-booster",
+  "version": "1.0.0",
+  "description": "",
+  "main": "content.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Asort97/ChatGPT-booster.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/Asort97/ChatGPT-booster/issues"
+  },
+  "homepage": "https://github.com/Asort97/ChatGPT-booster#readme",
+  "devDependencies": {
+    "jsdom": "^29.1.1"
+  }
+}

@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Speed Booster",
-  "version": "1.0.0",
-  "description": "Fix lag & freezing in long ChatGPT chats by hiding off-screen messages. 100% Local, no tracking.",
-  "permissions": ["storage"],
+  "version": "3.0.0",
+  "description": "Fix lag & freezing in long ChatGPT chats by rendering only the latest messages. 100% Local, no tracking.",
+  "permissions": ["storage", "activeTab"],
   "host_permissions": [
     "https://chatgpt.com/*",
     "https://chat.openai.com/*"
@@ -14,8 +14,19 @@
         "https://chatgpt.com/*",
         "https://chat.openai.com/*"
       ],
+      "js": ["page-script.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    },
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
       "js": ["content.js"],
-      "run_at": "document_idle"
+      "run_at": "document_start",
+      "all_frames": false
     }
   ],
   "action": {
